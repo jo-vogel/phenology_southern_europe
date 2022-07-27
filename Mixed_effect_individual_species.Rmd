@@ -1,0 +1,754 @@
+---
+title: "Mixed_effect_individual_species"
+author: "Johannes Vogel"
+date: "13 9 2021"
+output: html_document
+---
+  
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+# Document structure
+# Preprocessing: set parameters
+
+
+
+
+```
+
+```{r Preprocessing}
+library(tictoc)
+library(nlme)
+library(foreach)
+library(doParallel)
+library(colorspace)
+library(raster)
+library(ggeffects)
+library(car)
+library(scales)
+library(tidyverse)
+library(ggridges)
+library(maps)
+library(patchwork)
+library(rgdal)
+
+load(file="./Workspaces/Processed_data_30day_des_4prec_classes.RData") # from Basic_setup.R
+border <- readOGR('C:/Promotion/Data/ne_50m_admin_0_countries/ne_50m_admin_0_countries.shp')	
+data_red$country <- map.where("world", data_red$lon, data_red$lat)
+# Add country name, where map.where did not work
+data_red$country[data_red$lonlat=="17.9833 42.7167"] <- "Croatia"
+data_red$country[data_red$lonlat=="19.0833 42.0833"] <- "Montenegro"
+data_red$country[data_red$lonlat=="3.57065 43.3314"] <- "France"
+data_red$phase_type[data_red$phase_type == "sprout"] <- "leaf"
+vec_name <- c("leaf" = "Leaf unfolding", "flower" = "Flowering", "fruit" = "Fruiting", 
+              "senes" = "Senescence")
+data_red$phase_type_long <- vec_name[data_red$phase_type]
+
+# Model with 30-day running mean, deviation from mean date, normal, deseasonalised predictors, 3-month time span, mixed effect, phase types (not id), 4 prec classes
+years_min <- 30
+# years_min <- 20
+# years_min <- 15
+
+# num_species <- 5
+# num_species <- 20
+num_species <- 7
+# num_species <- 81 # based on length(unique(data_red$species))
+
+run <- paste0("30_day_deviation_des_normal_4_months_phase_types_4classes_",years_min, "_", num_species)
+
+# Phase adjustment
+data_red$phase_id <- factor(data_red$phase_id, levels = c(unique(as.character(data_red$phase_id)), "99"))
+data_red$phase_id[data_red$phase_id == "9RX"] <- 99 # put phase "recolección" to "harvested product"
+data_red$phase_id[data_red$phase_id == "0SX"] <- 0 # put phase "siembra" to "seed"
+data_red$phase_id <- str_remove(data_red$phase_id, "X")
+data_red$phase_id <- str_remove(data_red$phase_id, "M")
+data_red$phase_id <- str_remove(data_red$phase_id, "F")
+data_red$phase_id <- as.numeric(data_red$phase_id)
+
+
+data_red$len <- sapply(1:dim(data_red)[1], function(x)  dim(data_red[["data"]][[x]])[1] )
+data_red <- data_red[!(is.na(data_red$phase_type)),]
+data_red <- data_red %>% filter(phase_type %in% c("leaf", "flower", "fruit", "senes"))
+data_red <- data_red[data_red$len >= years_min,]
+
+data_red$phase_type <- factor(data_red$phase_type, levels = c("leaf", "flower", "fruit", "senes"), ordered = T)
+data_red$phase_type_long <- factor(data_red$phase_type_long, levels = c("Leaf unfolding", "Flowering", "Fruiting", "Senescence"), ordered = T)
+data_red$phase_type <- factor(data_red$phase_type, levels = rev(c("leaf", "flower", "fruit", "senes")), ordered = T)
+
+# Plant type adjustment
+data_red$plant_type[data_red$plant_type == "Shrub"] <- "Deciduous shrub"
+data_red$plant_type[data_red$plant_type == "Other (Shrub)"] <- "Deciduous shrub"
+data_red$plant_type[data_red$plant_type == "Shrub (evergreen)"] <- "Evergreen shrub"
+data_red$species[data_red$species == "Populus"] <- "Populus sp."
+data_red$species[data_red$species == "Betula pubescens (B. alba = B. celtiberica)"] <- "Betula pubescens"
+data_red$species[data_red$species == "Cydonia oblonga (= Cydonia vulgaris)"] <- "Cydonia oblonga"
+data_red$species[data_red$species == "Malus domestica (= Malus pumila)"] <- "Malus domestica"
+data_red$species[data_red$species == "Rosa"] <- "Rosa sp."
+data_red$species[data_red$species == "Salix"] <- "Salix sp."
+"update this properly at a later stage"
+
+# remove false Italian entry (actually Switzerland)
+data_red <- data_red[data_red$lonlat!="9.03379 45.8578",] 
+
+
+# Chronological order of all time series
+not_chron <- rep(NA, dim(data_red)[1])
+for (i in 1:dim(data_red)[1]){
+  not_chron[i] <-  all(data_red[["data"]][[i]]$year == cummax(data_red[["data"]][[i]]$year))
+}
+for (i in which(not_chron==0)){
+  data_red[["data"]][[i]] <- data_red[["data"]][[i]][order(data_red[["data"]][[i]]$year),]
+}
+
+```
+
+```{r Spatial map}
+# 15 year points, 20 year points, 30 year points: not easy to show this on map, since there can be different lengths for a location
+
+phen_coord_unique <- data_red[!duplicated(data_red$lonlat),]
+phen_sp <- SpatialPoints(coords = data.frame(phen_coord_unique$lon,phen_coord_unique$lat), proj4string=CRS("+proj=longlat +ellps=WGS84 +datum=WGS84 +no_defs+ towgs84=0,0,0"))
+phen_sp <- SpatialPointsDataFrame(coords = data.frame(phen_coord_unique$lon,phen_coord_unique$lat), proj4string=CRS("+proj=longlat +ellps=WGS84 +datum=WGS84 +no_defs+ towgs84=0,0,0"), data=as.data.frame(phen_coord_unique$dataset))
+
+png(paste0("./Output/spatial_map", run, ".png"), width = 17, height = 15, units = "cm", res = 1200)
+plot(border, xlim=c( range(phen_coord_unique$lon)[1], range(phen_coord_unique$lon)[2]), ylim=c(range(phen_coord_unique$lat)[1],range(phen_coord_unique$lat)[2]))
+points(subset(phen_sp,phen_sp@data[["phen_coord_unique$dataset"]]=="PEP725"), pch=16, col = "blue")
+points(subset(phen_sp,phen_sp@data[["phen_coord_unique$dataset"]]=="AEMET"), pch=16, col = "brown")
+points(subset(phen_sp,phen_sp@data[["phen_coord_unique$dataset"]]=="agroclim_pro" | phen_sp@data[["phen_coord_unique$dataset"]]=="agroclim_inrae"), pch=16, col = "orange")
+legend("topright", legend=c("PEP725","AEMET", "Tempo"), pch=16, col = c("blue", "brown", "orange"))
+box(bty="o") # add box around plot frame
+dev.off()
+```
+
+```{r Linear trend}
+
+
+par(mfrow= c(5,5))
+case <- sample(dim(data_red)[1], 25)
+p_val <- vector("numeric", dim(data_red)[1])
+slope <- vector("numeric", dim(data_red)[1])
+mk_p <- vector("numeric", dim(data_red)[1])
+j <- 1
+# for (i in case){
+for (i in 1:dim(data_red)[1]){  
+  lm_ex <- lm(data_red[["data"]][[i]]$day ~ data_red[["data"]][[i]]$year)
+  # plot(data_red[["data"]][[i]]$year, data_red[["data"]][[i]]$day, xlab= "Year", ylab="Day of the year", type="l", col="blue")
+  # abline(lm_ex, col= "darkblue")
+  s_lm_ex <- summary(lm_ex)
+  slope[j] <- s_lm_ex$coefficients[2,1]
+  p_val[j] <- s_lm_ex$coefficients[2,4]
+  j <- j + 1
+}
+
+sum(p_val < 0.05, na.rm = T) # significant correlation between year and day of the year
+sum((p_val < 0.05) == (mk_p < 0.05), na.rm = T) / dim(data_red)[1] # 0.92% agreement
+sum(slope > 0) / dim(data_red)[1]
+sum(slope < 0) / dim(data_red)[1]
+"2/3 of slopes are negative (earlier date). the rest is probably often senescence."
+
+# barplot per phase
+sign_sig <- rep(NA, dim(data_red)[1])
+sign_sig[which(slope < 0 & p_val < 0.05)] <- "sig. neg." # significant negative slope
+sign_sig[which(slope < 0 & p_val > 0.05)] <- "non-sig. neg." # significant negative slope
+sign_sig[which(slope > 0 & p_val > 0.05)] <- "non-sig pos." # significant positive slope
+sign_sig[which(slope > 0 & p_val < 0.05)] <- "sig. pos." # significant positive slope
+
+data_red$slope <- slope
+data_red$p_val <- p_val
+data_red$sign_sig <- sign_sig
+
+# sign_sig <- factor(sign_sig, levels = c("sn", "nsn", "nsp", "sp"), ordered = T)
+sign_sig <- factor(sign_sig, levels = c("sig. neg.", "non-sig. neg.", "non-sig pos.", "sig. pos."), ordered = T)
+sign_sig <- sign_sig[data_red$len >= years_min]
+sign_sig_table <- vector("list")
+
+png(paste0("./Output/barplot_trend_", run, ".png"), width = 17, height = 15, units = "cm", res = 1200)
+# par(mfrow=c(2,2), mar=c(3,3,2,4))
+par(mfrow=c(2,2), oma=c(0,5,0,0), mar=c(3,1,2,4))
+# for (i in c("leaf", "flower", "fruit", "senes")){
+for (i in c("Leaf unfolding", "Flowering", "Fruiting", "Senescence")){
+  # barplot(table(sign_sig[data_red$phase_type == i]), main = paste(i, "Time series significance \n for" , years_min, "year minimum"), horiz=T, las=1, col="darkblue")
+  if (i == "Leaf unfolding" || i == "Fruiting"){
+    barplot(table(sign_sig[data_red$phase_type_long == i]), main = i, horiz=T, las=1, col="darkblue")
+  } else {
+    barplot(table(sign_sig[data_red$phase_type_long == i]), main = i, horiz=T, las=1, col="darkblue", yaxt="n")
+  }
+
+  sign_sig_table[[i]] <- table(sign_sig[data_red$phase_type_long == i])
+  
+  print(i)
+  # Percentage of negative trends
+  print("Percentage of negative trends")
+  # print((sign_sig_table[[i]][["sn"]] + sign_sig_table[[i]][["nsn"]]) / sum(sign_sig_table[[i]]))
+  print((sign_sig_table[[i]][["sig. neg."]] + sign_sig_table[[i]][["non-sig. neg."]]) / sum(sign_sig_table[[i]]))
+  
+  # Percentage of significantly negative trends (of all trends)
+  print("Percentage of significantly negative trends (of all trends)")
+  # print(sign_sig_table[[i]][["sn"]] / sum(sign_sig_table[[i]]))
+  print(sign_sig_table[[i]][["sig. neg."]] / sum(sign_sig_table[[i]]))
+  
+  # Percentage of positive trends
+  print("Percentage of positive trends")
+  # print((sign_sig_table[[i]][["sp"]] + sign_sig_table[[i]][["nsp"]]) / sum(sign_sig_table[[i]]))
+  print((sign_sig_table[[i]][["sig. pos."]] + sign_sig_table[[i]][["non-sig pos."]]) / sum(sign_sig_table[[i]]))
+  
+  # Percentage of significantly positive trends (of all trends)
+  print("Percentage of significantly positive trends (of all trends)")
+  # print(sign_sig_table[[i]][["sp"]] / sum(sign_sig_table[[i]]))
+  print(sign_sig_table[[i]][["sig. pos."]] / sum(sign_sig_table[[i]]))
+  
+} 
+dev.off()
+
+
+
+
+# Distribution plot of magnitude per phase
+
+
+# slope_tib <- tibble(Magnitude= slope, Phase = data_red$phase_type, Humidity = data_red$prec_class)
+# slope_tib <- filter(slope_tib, data_red$len >=  years_min) # time series over 30 years
+# slope_red <- slope_tib %>% filter(Phase %in% c("leaf", "flower", "fruit", "senes"))
+slope_tib <- tibble(Magnitude = slope, Phase = data_red$phase_type_long, Species = data_red$species)
+slope_tib <- filter(slope_tib, data_red$len >= years_min) # time series over minimum years (15, 20 ,30)
+slope_red <- slope_tib %>% filter(Phase %in% c("Leaf unfolding", "Flowering", "Fruiting", "Senescence"))
+# slope_red <- slope_red %>% filter(Species %in% species_sub[1:num_species])
+
+ggplot(slope_red, aes(x = Magnitude, y = Phase, fill = Phase)) +
+  # geom_density_ridges2( stat="binline") +
+  geom_density_ridges2() +
+  theme_ridges(center_axis_labels = TRUE) + 
+  theme(legend.position = "none")+
+  geom_vline(aes(xintercept = 0)) +
+  # labs(title = paste("Magnitude of slope (days per year) for all species"))
+  labs(title = "")
+ggsave(filename = paste0("./Output/ridge_model_", run, "_ind_all_species.png"), width = 8, height = 8)
+
+
+"be aware: this is for all species, not for all time series" # this can be justified since I want a diversity of species (within each plant functional type) and not a bias by species which are particularly well presented
+# ggplot(slope_red, aes(x = Magnitude, fill = Phase)) +
+ggplot(slope_red, aes(x = Magnitude, fill = Magnitude > 0)) +
+  geom_histogram(breaks=seq(-1.2, 1.2, by=0.1))+
+  theme_bw() +
+  theme(legend.position = "none")+
+  geom_vline(aes(xintercept = 0)) +
+  facet_wrap(~ Phase, nrow = 4, scales = "free_y")+
+  # labs(title = paste("Magnitude of slope (days per year) for all species"))
+  labs(title = "")+
+  ylab("Phase")+
+  xlab("Slope magnitude")+
+  scale_fill_brewer(palette="Dark2")+
+  theme(axis.title = element_text(size = 20), strip.text = element_text(size = 20), axis.text = element_text(size = 13))
+ggsave(filename = paste0("./Output/hist_model_", run, "_ind_all_species.png"), width = 8, height = 8)
+
+# Median / mean slope per phase (for all time series)
+print(slope_red %>% select(Magnitude) %>% summarise(median = median(Magnitude)))
+print(slope_red %>% select(Magnitude) %>% summarise(mean = mean(Magnitude)))
+for (i in c("Leaf unfolding", "Flowering", "Fruiting", "Senescence")){
+  print(i)
+  print(filter(slope_red, Phase == i) %>% select(Magnitude) %>% summarise(median = median(Magnitude)))
+  print(filter(slope_red, Phase == i) %>% select(Magnitude) %>% summarise(mean = mean(Magnitude)))
+  print(filter(slope_red, Phase == i) %>% select(Magnitude) %>% summarise(sd = sd(Magnitude)))
+}
+
+
+# Number of time series for each species for each phase type
+
+num_pro_phase <- matrix(NA, length(unique(data_red$species)), 7)
+colnames(num_pro_phase) <- c("leaf", "flower", "fruit", "senes", "Multiplied", "Added", "plant_type")
+rownames(num_pro_phase) <- unique(data_red$species)
+for (j in unique(data_red$species)){
+  for (i in c("leaf", "flower", "fruit", "senes")){
+    num_pro_phase[j,i]  <- sum(data_red$species == j & data_red$phase_type == i)
+  }
+}
+num_pro_phase <- as.data.frame(num_pro_phase)
+num_pro_phase <- rbind(num_pro_phase, "All" = apply(num_pro_phase,2,sum))
+num_pro_phase$Multiplied <- (num_pro_phase[,1]*num_pro_phase[,2]*num_pro_phase[,3]*num_pro_phase[,4])/100
+num_pro_phase$Added <- num_pro_phase[,1]+num_pro_phase[,2]+num_pro_phase[,3]+num_pro_phase[,4]
+num_pro_phase$plant_type <- data_red[match(rownames(num_pro_phase), data_red$species),]$plant_type
+write.csv(num_pro_phase, file = paste0("./Workspaces/Number_of_time_series_", run, ".csv"))
+# species_sub <- names(sort(num_pro_phase[,5], decreasing = T))
+
+# num_per_spec15 <- read.csv(file = "./Workspaces/Number_of_time_series_30_day_deviation_des_normal_3_months_phase_types_4classes_15.csv", row.names = 1)
+# num_per_spec20 <- read.csv(file = "./Workspaces/Number_of_time_series_30_day_deviation_des_normal_3_months_phase_types_4classes_20.csv", row.names = 1)
+# num_per_spec30 <- read.csv(file = "./Workspaces/Number_of_time_series_30_day_deviation_des_normal_3_months_phase_types_4classes_30.csv", row.names = 1)
+
+# good choices include Prunus avium, Aesculus hippocastanum, Pyrus communis, Malus domestica, Prunus domestica, Quercus robur, Fagus sylvatica, as well as
+# Zea Mays, Vitis vinifera, Sambucus nigra
+# for 30 and 20 years the choice is rather similar
+# species_sub <- c("Prunus avium", "Aesculus hippocastanum", "Pyrus communis", "Malus domestica", "Prunus domestica", "Quercus robur", "Fagus sylvatica", "Zea mays", "Vitis vinifera", "Sambucus nigra")
+species_sub <- c("Prunus avium", "Aesculus hippocastanum", "Pyrus communis", "Malus domestica", "Zea mays", "Vitis vinifera", "Sambucus nigra")
+# species_sub <- unique(data_red$species)
+# according to 15 year criterium these are the 4 broadleaf deciduous trees, 2 shrubs and 1 crop with the highest number of time series
+
+slope_red_species <- slope_red %>% filter(Species %in% species_sub)
+
+ggp <- ggplot(slope_red_species, aes(x = Magnitude, y = Species, fill = Phase, scale = 0.9)) +
+# ggp <- ggplot(slope_red, aes(x = Magnitude, y = Species, fill = Magnitude > 0, scale = 0.9)) + # this does not work yet, values below and above 0 are scaled to have an equal amount and thus biased
+  theme_ridges(center_axis_labels = TRUE) +  
+  theme(legend.position = "none")+
+  geom_vline(aes(xintercept = 0))+
+  facet_wrap( ~ Phase) +
+  labs(title = paste("Magnitude of slope (days per year) for individual species"))
+# ggp + geom_density_ridges2(stat="binline", breaks=seq(-1.2, 1.2, by=0.1)) 
+ggp + geom_density_ridges2(stat="binline") 
+ggsave(filename = paste0("./Output/ridge_model_", run, "_ind_species3.png"), width = 8, height = 8)
+ggp + geom_density_ridges2()
+ggsave(filename = paste0("./Output/ridge_model_", run, "_ind_species_v2.png"), width = 8, height = 8)
+
+# ggp <- ggplot(slope_red, aes(x = Magnitude, fill = Phase)) +
+ggp <- ggplot(slope_red_species, aes(x = Magnitude, fill = Magnitude > 0)) +
+  theme(legend.position = "none")+
+  geom_vline(aes(xintercept = 0))+
+  facet_grid(Species ~ Phase, scales = "free_y") +
+  labs(title = paste("Magnitude of slope (days per year) for individual species"))+
+  ylab("Phase")
+ggp + geom_histogram(breaks=seq(-1.2, 1.2, by=0.1))
+ggsave(filename = paste0("./Output/hist_model_", run, "_ind_species_v2.png"), width = 8, height = 8)
+
+
+
+```
+
+```{r Investigate suitable species and temporal length}
+
+# Number of time series for each species for each phase type
+
+num_pro_phase <- matrix(NA, length(unique(data_red$species)), 5)
+colnames(num_pro_phase) <- c("leaf", "flower", "fruit", "senes", "Multiplied")
+rownames(num_pro_phase) <- unique(data_red$species)
+for (j in unique(data_red$species)){
+  for (i in c("leaf", "flower", "fruit", "senes")){
+    num_pro_phase[j,i]  <- sum(data_red$species == j & data_red$phase_type == i)
+  }
+}
+
+num_pro_phase[,5] <- num_pro_phase[,1]*num_pro_phase[,2]*num_pro_phase[,3]*num_pro_phase[,4]
+names(sort(num_pro_phase[,5], decreasing = T))
+# species_sub <- names(sort(num_pro_phase[,5], decreasing = T))
+
+# cases <- cbind(rep(c("leaf", "flower", "fruit", "senes"), each = num_species), rep(species_sub[1:num_species], 4))
+cases <- cbind(rep(c("leaf", "flower", "fruit", "senes"), each = num_species), rep(species_sub, 4))
+
+
+
+
+
+# Temporal length in regard to slope and sign ----------------------------------------------------------
+
+slope_spec_phase <- tapply(data_red$slope, list(data_red$species, data_red$phase_type), median)
+slope_phase <- tapply(data_red$slope, data_red$phase_type, median)
+
+# View(slope_spec_phase[c(species_sub[1:num_species]),])
+
+# compare this with significances 
+
+
+
+for (i in 1:dim(cases)[1]){
+  print(paste(cases[i,1], cases[i,2]))
+  print(table(sign_sig[data_red$species == cases[i,2] & data_red$phase_type == cases[i,1]]))
+  print(slope_spec_phase[which(rownames(slope_spec_phase) == cases[i,2]), which(colnames(slope_spec_phase) == cases[i,1])])
+}
+
+
+
+
+
+# slope per species and phase
+# tb <- c("Shrub" = 1, "Deciduous broadleaf tree" = 2, "Other (Shrub)" = 3, "Crop" = 4, "Evergreen needleleaf tree" = 5, "Evergreen broadleaf tree" = 6, "Perennial herb" = 7, "Shrub (evergreen)" = 8)
+tb <- c("Deciduous shrub" = 1, "Deciduous broadleaf tree" = 2, "Evergreen shrub" = 3, "Crop" = 4, "Evergreen needleleaf tree" = 5, "Evergreen broadleaf tree" = 6, "Perennial herb" = 7)
+data_red$plant_type_num <- tb[data_red$plant_type]
+mag_phase <- vector("list",4)
+names(mag_phase) <- c("Leaf unfolding", "Flowering", "Fruiting", "Senescence")
+adj <- 10
+slopes_species_list <- vector("list",0)
+
+for (k in c("Leaf unfolding", "Flowering", "Fruiting", "Senescence")){
+  data_red_ph <- data_red[data_red$phase_type_long == k & !is.na(data_red$phase_type_long),]
+  # data_red_ph <- data_red_ph[data_red_ph$len >= 30,] # only for time series above 30 years
+  slopes_species <- sort(tapply(data_red_ph$slope,data_red_ph$species, mean))
+  slopes_species_len <- sort(tapply(data_red_ph$slope,data_red_ph$species, length)) # number of time series per species and phase
+  slopes_species_len_tib <- tibble("species" = names(slopes_species_len), "Number" = slopes_species_len)
+  slopes_species_df <- tibble("slopes" = slopes_species, "plant_type_num" = data_red[match(names(slopes_species),   data_red$species),]$plant_type_num,
+                              "plant_type" = data_red[match(names(slopes_species), data_red$species),]$plant_type, "species" =   names(slopes_species))
+  slopes_species_df$plant_type_num <- as.factor(slopes_species_df$plant_type_num)
+  # slopes_species_df$plant_type <- factor(slopes_species_df$plant_type, levels = c("Deciduous broadleaf tree", "Shrub", "Other (Shrub)", "Crop", "Evergreen needleleaf tree", "Evergreen broadleaf tree", "Perennial herb", "Shrub (evergreen)"))
+  # slopes_species_df$plant_type <- factor(slopes_species_df$plant_type, levels = c("Deciduous broadleaf tree", "Evergreen needleleaf tree", "Evergreen broadleaf tree", "Deciduous shrub", "Evergreen shrub", "Crop", "Perennial herb"))
+  # slopes_species_df$`Plant functional type` <- factor(slopes_species_df$plant_type, levels = c("Deciduous broadleaf tree", "Evergreen needleleaf tree", "Evergreen broadleaf tree", "Deciduous shrub", "Evergreen shrub", "Crop", "Perennial herb"))
+  slopes_species_df$`Plant functional type` <- factor(slopes_species_df$plant_type, levels = c("Deciduous broadleaf tree", "Evergreen broadleaf tree", "Evergreen needleleaf tree", "Deciduous shrub", "Crop", "Perennial herb")) # without evergreen shrub (only 1 time series available)
+  slopes_species_df <- full_join(slopes_species_df, slopes_species_len_tib, by = "species" )
+  slopes_species_df <- slopes_species_df[slopes_species_df$Number>3,] # include only those species with a certain length
+  slopes_species_list[[k]] <- slopes_species_df
+  
+  if (k == "Leaf unfolding"){
+    ticks <- seq(-0.2, 0, 0.1)
+  }
+  if (k == "Flowering"){
+    # slopes_species_df <- slopes_species_df[-sample(30, 11),]
+    # slopes_species_df <- slopes_species_df[c(1,3,4,5,6,8,9,11,12,13,14,15,19,21,22,26,28,29,30),] # pick reduced sample
+    ticks <- seq(-0.4, 0, 0.2)
+  }
+  if (k == "Fruiting"){
+    ticks <- seq(-0.5, 0, 0.25)
+  }
+  if (k == "Senescence"){
+    ticks <- seq(-0.05, 0.05, 0.05)
+  }
+  
+  mag_phase[[k]] <- ggplot(data = slopes_species_df) +
+    geom_col(
+      mapping = aes(x = reorder(species, slopes, FUN = median), y = slopes, fill = `Plant functional type`), size = 8
+    ) + coord_flip() + 
+    geom_label(aes(x = reorder(species, slopes, FUN = median), y = (max(slopes) + diff(range(slopes))/(adj-3)), label = Number), size=12) +
+    # geom_label(aes(x = reorder(species, slopes, FUN = median), y = (max(slopes_species_df$slopes) + diff(range(slopes_species_df$slopes))/(adj+0.8)), label = Number), size=12) +
+    # geom_label(aes(x = reorder(species, slopes, FUN = median), y = (max(slopes) + diff(range(slopes))/adj*0.7), label = Number), size=12) +
+    # geom_label(aes(x = reorder(species, slopes, FUN = median), y = (max(slopes)), label = Number), size=12) +
+    theme(axis.text.x =element_text(size=35), axis.text.y =element_text(size=35), axis.title=element_text(size=47), 
+          legend.text=element_text(size=35), legend.title=element_text(size=35), plot.title = element_text(size=55)) +
+    # labs(y = "Magnitude of slope", x = "Species", title = k) +
+    labs(y = "Slope magnitude", x = "", title = k) +
+    # ylim(min(slopes_species_df$slopes), (max(slopes_species_df$slopes) + diff(range(slopes_species_df$slopes))/(adj-5)))+
+    # ylim(min(slopes_species_df$slopes), (max(slopes_species_df$slopes))+
+    scale_fill_manual(#values = c("red", "blue", "green", "purple", "pink", "yellow", "orange", "blue"),
+      # values = hue_pal(h = c(10, 360))(8),
+      values = hue_pal(h = c(10, 360))(7),
+      # labels = c("Deciduous broadleaf tree", "Shrub", "Other (Shrub)", "Crop", "Evergreen needleleaf tree", "Evergreen broadleaf tree", "Perennial herb", "Shrub (evergreen)"), drop = FALSE)
+      # labels = c("Deciduous broadleaf tree", "Evergreen needleleaf tree", "Evergreen broadleaf tree", "Deciduous shrub", "Evergreen shrub", "Crop", "Perennial herb"), drop = FALSE)+
+      labels = c("Deciduous broadleaf tree", "Evergreen broadleaf tree", "Evergreen needleleaf tree", "Deciduous shrub", "Crop", "Perennial herb"), drop = FALSE)+ # without evergreen shrub (only 1 time series available)
+    # theme(legend.position="none", axis.ticks = element_line(ticks), axis.text.y = element_text(ticks))
+    theme(legend.position="none")+ # comment out to have legend
+    # scale_y_continuous(breaks = ticks, labels = ticks)
+    scale_y_continuous(breaks = ticks, labels = ticks, limits = c(min(slopes_species_df$slopes), (max(slopes_species_df$slopes) + diff(range(slopes_species_df$slopes))/(adj-5))))
+}
+mag_phase[[1]] + mag_phase[[2]] + mag_phase[[3]] + mag_phase[[4]] +
+  plot_layout(nrow=1, ncol=4)
+ggsave(paste0("./Output/ggbarplot_trend_", run, "all_phases.png"), width = 44, height = 25)
+# ggsave(paste0("./Output/ggbarplot_trend_", run, "all_phases_legend.png"), width = 44, height = 25) # version with legend
+
+# Slope per phase and plant functional type
+filter(slopes_species_list[["Leaf unfolding"]], plant_type == "Deciduous broadleaf tree") %>% summarise (median = median(slopes))
+filter(slopes_species_list[["Flowering"]], plant_type == "Deciduous broadleaf tree") %>% summarise (median = median(slopes))
+filter(slopes_species_list[["Fruiting"]], plant_type == "Deciduous broadleaf tree") %>% summarise (median = median(slopes))
+filter(slopes_species_list[["Leaf unfolding"]], plant_type == "Deciduous shrub") %>% summarise (median = median(slopes))
+filter(slopes_species_list[["Flowering"]], plant_type == "Deciduous shrub") %>% summarise (median = median(slopes))
+filter(slopes_species_list[["Fruiting"]], plant_type == "Deciduous shrub") %>% summarise (median = median(slopes))
+filter(slopes_species_list[["Fruiting"]], plant_type == "Crop") %>% summarise (median = median(slopes))
+
+# Mean, median, sd and se per phenophase (for all species)
+for (k in c("Leaf unfolding", "Flowering", "Fruiting", "Senescence")){
+print(k)
+print(mean(slopes_species_list[[k]]$slopes))  
+print(median(slopes_species_list[[k]]$slopes))  
+print(sd(slopes_species_list[[k]]$slopes)) # Standard deviations for phases
+print(sd(slopes_species_list[[k]]$slopes)/sqrt(length(slopes_species_list[[k]]$species))) # Standard error
+# For standard deviations / errors for individual species see ggbarplot_trend_standard_deviation_error.R
+}
+
+
+# All species
+# slopes_species_df <- vector("list", 4)
+# j <- 1
+# for (k in c("leaf", "flower", "fruit", "senes")){
+#   data_red_ph <- data_red[data_red$phase_type == k & !is.na(data_red$phase_type),]
+#   data_red_ph <- data_red_ph[data_red_ph$len >= 30,] # only for time series above 30 years
+#   slopes_species <- sort(tapply(data_red_ph$slope,data_red_ph$species, mean))
+#   slopes_species_df[[j]] <- tibble("slopes" = slopes_species, "plant_type_num" = data_red[match(names(slopes_species), data_red$species),]$plant_type_num,
+#                             "plant_type" = data_red[match(names(slopes_species), data_red$species),]$plant_type, "species" = names(slopes_species))
+#   j <- j + 1
+# }
+# slopes_species_df2 <- tibble("slopes" = c(slopes_species_df[[1]]$slopes, slopes_species_df[[2]]$slopes, slopes_species_df[[3]]$slopes, slopes_species_df[[4]]$slopes),
+#                              "plant_type_num" = c(slopes_species_df[[1]]$plant_type_num, slopes_species_df[[2]]$plant_type_num, slopes_species_df[[3]]$plant_type_num, slopes_species_df[[4]]$plant_type_num),
+#                              "plant_type" = c(slopes_species_df[[1]]$plant_type, slopes_species_df[[2]]$plant_type, slopes_species_df[[3]]$plant_type, slopes_species_df[[4]]$plant_type),
+#                              "species" = c(slopes_species_df[[1]]$species, slopes_species_df[[2]]$species, slopes_species_df[[3]]$species, slopes_species_df[[4]]$species),
+#                              "phase_type" = c(rep("leaf", dim(slopes_species_df[[1]])[1]), rep("flower", dim(slopes_species_df[[2]])[1]),
+#                                               rep("fruit", dim(slopes_species_df[[3]])[1]), rep("senes", dim(slopes_species_df[[4]])[1]))
+#                              )
+# slopes_species_df2$plant_type_num <- as.factor(slopes_species_df2$plant_type_num)
+# slopes_species_df2$plant_type <- as.factor(slopes_species_df2$plant_type)
+# 
+# ggplot(data = slopes_species_df2) +
+# geom_col(
+#   # mapping = aes(x = reorder(species, slopes, FUN = median), y = slopes, fill = plant_type), size = 8
+#   mapping = aes(x = species, y = slopes, fill = plant_type), size = 8
+# ) + coord_flip() +
+#   theme(axis.text=element_text(size=25), axis.title=element_text(size=25,face="bold"),
+#         legend.text=element_text(size=25), legend.title=element_text(size=25)) +
+#   labs(y = "Magnitude of slope", x = "Species") +
+#   facet_wrap( ~ phase_type)
+# ggsave(paste0("./Output/ggbarplot_trend_", run, "all_species.png"), width = 15, height = 25)
+
+
+"you can see clearly, that the pattern changes drastically from rather evenly spaced to a clear trend from threshold 15 to 30 years"
+
+```
+
+
+```{r Model building}
+
+# data_red_un <- unnest(data_red, cols = c(data))
+data_red_un <- unnest(data_red, cols = c(data))
+# Dependent on case: either lon and lat as numeric (continuous variable) or factor (as a variable for "site")
+data_red_un$lon <- as.numeric(data_red_un$lon)
+data_red_un$lat <-as.numeric(data_red_un$lat)
+var_cols <- str_detect(colnames(data_red_un), "rr") | str_detect(colnames(data_red_un), "tg")
+lla_cols <- colnames(data_red_un) == "lon" | colnames(data_red_un) == "lat" | colnames(data_red_un) == "alt" 
+# data_red_un_complete <- data_red_un[complete.cases(data_red_un[,which(var_cols)]),] # drop rows with NAs
+data_red_un_complete <- data_red_un[complete.cases(data_red_un[,which(lla_cols | var_cols)]),] # drop rows with NAs
+# rescale variables beforehand using z-score normalization
+data_red_norm <- data_red_un_complete
+data_red_norm[,which(lla_cols | var_cols)] <- scale(data_red_un_complete[,which(lla_cols | var_cols)])
+
+
+data_red_cases <- vector("list", dim(cases)[1])
+exist <- rep(NA,dim(cases)[1])
+for (case in 1:dim(cases)[1]) {
+  data_red_cases[[case]] <- filter(data_red_norm, phase_type == cases[case,1], species == cases[case,2])
+  exist[case] <- dim(data_red_cases[[case]])[1] != 0
+}
+names(data_red_cases) <- paste0(cases[,1], "_", cases[,2])
+
+
+tic()
+no_cores <- detectCores() - 1
+cl<-makeCluster(no_cores)
+registerDoParallel(cl)
+mod_case <- foreach (case = which(exist), .packages = c("lme4", "tidyverse", "nlme")) %dopar%{
+  data_red_case <- filter(data_red_norm, phase_type == cases[case,1], species == cases[case,2])
+  # lm(formula = devDOY ~  tg_l0*rr_l0 + tg_l30*rr_l30 + tg_l60*rr_l60 + lon + lat + alt, data = data_red_case)
+  # lm(formula = devDOY ~  tg_l0*rr_l0 + tg_l30*rr_l30 + tg_l60*rr_l60 + tg_l90*rr_l90 + tg_l120*rr_l120 + tg_l150*rr_l150 + tg_l180*rr_l180 + lon + lat + alt, data = data_red_case)
+    lm(formula = devDOY ~  tg_l0*rr_l0 + tg_l30*rr_l30 + tg_l60*rr_l60 + tg_l90*rr_l90 + tg_l120*rr_l120 + lon + lat + alt, data = data_red_case)
+}
+mod_all <- foreach (phase = c("leaf", "flower", "fruit", "senes"), .packages = c("lme4", "tidyverse")) %dopar%{
+  data_red_case <- filter(data_red_norm, phase_type == phase)
+  # lmer(formula = devDOY ~  tg_l0*rr_l0 + tg_l30*rr_l30 + tg_l60*rr_l60 + lon + lat + alt + (1|species), data = data_red_case)
+  # lmer(formula = devDOY ~  tg_l0*rr_l0 + tg_l30*rr_l30 + tg_l60*rr_l60 + tg_l90*rr_l90 + tg_l120*rr_l120 + tg_l150*rr_l150 + tg_l180*rr_l180 + lon + lat + alt + (1|species), data = data_red_case)
+    lmer(formula = devDOY ~  tg_l0*rr_l0 + tg_l30*rr_l30 + tg_l60*rr_l60 + tg_l90*rr_l90 + tg_l120*rr_l120 + lon + lat + alt + (1|species), data = data_red_case)
+}
+stopCluster(cl)
+toc()
+
+names(mod_case) <- paste0(cases[,1], "_", cases[,2])[which(exist)]
+names(mod_all) <- paste0(c("leaf", "flower", "fruit", "senes"), "_all_species")
+mod_case_joint <- c(mod_case, mod_all)
+mod_case_rev <- c(mod_all, mod_case) # first model for all species, then for individual species
+
+save(mod_case_joint, file = paste0("./Workspaces/model_", run, "_ind_species.RData"))
+```
+
+```{r Model prerequisites, eval=F}
+"set eval=T back at a later stage"
+
+# Model summary #### 
+####################
+
+summary(mod_case_joint[[case]])
+anova(mod_case_joint[[case]])
+
+
+# Collinearity ####
+###################
+
+# for (i in 1:length(mod_case_joint)){
+# for (i in c(1:3,5:23, 25:29)){
+for (i in c(1:3,5:23, 25, 28:29)){
+  vif(mod_case_joint[[i]])
+  par(mar=c(2,7,2,2))
+  barplot(sort(vif(mod_case_joint[[i]])), horiz=T, las=1, main = names(mod_case_joint[i]))
+
+}
+
+
+# see step 5 of Zuur.2010
+# sequentially drop the covariate with the highest VIF, recalculate the VIFs
+# and repeat this process until all VIFs are smaller than a preselected threshold.
+# threshold: 10 (or 3 or 2) Zuur.2010, 3 (or 5) Zuur.2009, p. 387, 536
+
+# VIF is sometimes high for alt, lat, lon, but a) this are
+# not variables of interest and b) these are categorical variables with
+# few values, thus this is to be expected
+
+# if you run the model without altitude (its coefficient is NA), you can calculate VIF for "Malus domestica leaf" and "Pyrus communis senes", too
+
+
+# https://corporatefinanceinstitute.com/resources/knowledge/other/variance-inflation-factor-vif/ 
+# However, there are also situations where high VFIs can be safely ignored without suffering from multicollinearity. The # following are three such situations:
+# 1.	High VIFs only exist in control variables but not in variables of interest. In this case, the variables of interest # are not collinear to each other or the control variables. The regression coefficients are not impacted.
+# 2.	3. When a dummy variable that represents more than two categories has a high VIF, multicollinearity does not # necessarily exist. The variables will always have high VIFs if there is a small portion of cases in the category, # regardless of whether the categorical variables are correlated to other variables
+
+
+
+# Homogeneity, normality, independence ####
+###########################################
+
+# Homogeneity
+par(mfrow=c(2,2))
+for (case in 1:length(mod_case_joint)){
+  print(plot(mod_case_joint[[case]]))
+}
+
+# Check for normality
+for (case in which(exist)){
+  # E <- rstandard(mod_case_joint[[case]]) # no applicable method for 'rstandard' applied to an object of class "c('glmerMod', 'merMod')"
+  E <- resid(mod_case_joint[[case]])
+  data_red_case <- filter(data_red_norm, phase_type == cases[case,1], species == cases[case,2])
+  # E <- resid(mod_case_joint[[case]], type = "pearson") # see Zuur.2009 p. 229-231
+  # E <- resid(mod_case_joint[[case]], type = "deviance")
+  # https://www.datascienceblog.net/post/machine-learning/interpreting_generalized_linear_models/ overview of residuals in glm
+  hist(E)
+  qqnorm(E)
+
+
+# Check for independence and homogeneity: residuals versus individual explanatory variables
+  par(mfrow=c(2,2))
+  # for (var in c("tg_l0", "rr_l0", "tg_l15", "rr_l15", "tg_l30", "rr_l30", "tg_l45", "rr_l45", "tg_l60", "rr_l60", "tg_l75", "rr_l75", "tg_l90", "rr_l90")){ #, "lon", "lat", "alt"
+  for (var in c("tg_l0", "rr_l0", "tg_l30", "rr_l30", "tg_l60", "rr_l60", "tg_l90", "rr_l90")){ #, "lon", "lat", "alt"  
+    # var_val <- unlist(data_red_case[[case]] %>% ungroup() %>% dplyr::select(var))
+    var_val <- unlist(data_red_case %>% ungroup() %>% dplyr::select(var))
+    # sam <- sample(length(E),length(E)/100)
+    plot(y = E, x = var_val, xlab = var,
+    # plot(y = E[sam], x = var_val[sam], xlab = var,
+         ylab = "Residuals")
+    abline(0,0)
+    abline(lm(E ~ var_val), col = "red")
+  }
+  for (var in c("lon", "lat", "alt", "species")){
+    # var_val <- unlist(data_red_case2[[case]] %>% ungroup() %>% dplyr::select(var))
+    var_val <- unlist(data_red_case %>% ungroup() %>% dplyr::select(var))
+    plot(E ~ as.factor(var_val), xlab = var,
+         ylab = "Residuals")
+    abline(0, 0)
+  }
+}
+
+```
+
+```{r Visualisation, fig.height=20, fig.width=10}
+
+# # Plot sign and magnitude
+"pick the arrangement of the plot"
+# mod_case <- mod_case_joint
+mod_case <- mod_case_rev
+
+sum_mod <- lapply(1:length(mod_case), function(x) summary(mod_case[[x]]))
+
+coeff_num <- sapply(1:length(sum_mod), function(x) length(sum_mod[[x]][["coefficients"]][-1,1]))
+coeff_mat <- sapply((1:length(sum_mod))[coeff_num==max(coeff_num)], function(x) sum_mod[[x]][["coefficients"]][-1,1])
+"be careful, you still exclude here some data"
+colnames(coeff_mat) <- names(mod_case)[coeff_num==max(coeff_num)]
+
+coeff_tib <- tibble("Variable" = rep(rownames(coeff_mat), dim(coeff_mat)[2]), "Magnitude" = as.vector(coeff_mat),
+                    "Case"= rep(colnames(coeff_mat), each = max(coeff_num)))
+
+# Heatmap 
+# coeff_tib$Variable <- factor(coeff_tib$Variable, levels = c("tg_l0", "tg_l30", "tg_l60", "rr_l0","rr_l30", "rr_l60",   "tg_l0:rr_l0", "tg_l30:rr_l30", "tg_l60:rr_l60", "lon", "lat", "alt"), ordered = T)
+# coeff_tib$Variable <- factor(coeff_tib$Variable, levels = c("tg_l0", "tg_l30", "tg_l60", "tg_l90","rr_l0","rr_l30", "rr_l60", "rr_l90",  "tg_l0:rr_l0", "tg_l30:rr_l30", "tg_l60:rr_l60", "tg_l90:rr_l90", "lon", "lat", "alt"), ordered = T)
+# coeff_tib$Variable <- factor(coeff_tib$Variable, levels = c("tg_l0", "tg_l30", "tg_l60", "tg_l90", "tg_l120", "tg_l150", "tg_l180","rr_l0","rr_l30", "rr_l60", "rr_l90", "rr_l120", "rr_l150", "rr_l180", "tg_l0:rr_l0", "tg_l30:rr_l30", "tg_l60:rr_l60", "tg_l90:rr_l90", "tg_l120:rr_l120", "tg_l150:rr_l150", "tg_l180:rr_l180", "lon", "lat", "alt"), ordered = T)
+coeff_tib$Variable <- factor(coeff_tib$Variable, levels = c("tg_l0", "tg_l30", "tg_l60", "tg_l90", "tg_l120", "rr_l0","rr_l30", "rr_l60", "rr_l90", "rr_l120",  "tg_l0:rr_l0", "tg_l30:rr_l30", "tg_l60:rr_l60", "tg_l90:rr_l90", "tg_l120:rr_l120", "lon", "lat", "alt"), ordered = T)
+
+# coeff_tib$Case <- factor(coeff_tib$Case, levels = c(paste0(cases[,1], "_", cases[,2])), ordered = T)
+# coeff_tib$Case <- factor(coeff_tib$Case, levels = names(mod_case), ordered = T)
+coeff_tib$Case <- factor(coeff_tib$Case, levels = rev(names(mod_case)), ordered = T) # reverse order for the plot
+# coeff_tib$Case <- factor(coeff_tib$Case, levels = c(paste0("leaf_", rownames(slope_spec_phase5_order_leaf)), paste0("flower_", rownames(slope_spec_phase5_order_flower)), paste0("fruit_", rownames(slope_spec_phase5_order_fruit)), paste0("senes_", rownames(slope_spec_phase5_order_senes))), ordered = T)
+
+coeff_tib_clim <- coeff_tib[!coeff_tib$Variable %in% c("lon", "lat", "alt"),] # only climatic variables
+
+l <- ggplot(coeff_tib, aes(Case, Variable))
+l + geom_raster(aes(fill = Magnitude), hjust=0.5, vjust=0.5,
+                interpolate=FALSE) +
+  scale_fill_continuous_diverging("Blue-Red 3")
+# scale_fill_continuous_diverging("Blue-Red 3", limits = c(-0.1,0.1))
+
+l <- ggplot(coeff_tib_clim, aes(Variable, Case))
+l <- l + geom_raster(aes(fill = Magnitude), hjust=0.5, vjust=0.5,
+                interpolate=FALSE) +
+  scale_fill_continuous_diverging("Blue-Red 3") +
+  # scale_fill_continuous_diverging("Blue-Red 3", limits =c(-20,20)) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  labs(title = paste("Magnitude of regression coefficients ")) +
+  ylab("Phenophase and species")
+ggsave(filename = paste0("./Output/heatmap_model_", run, "_ind_species.png"), width = 8, height = num_species*1.15, limitsize =F)
+l <- l + geom_text(aes(label = signif(Magnitude, 2)))
+ggsave(filename = paste0("./Output/heatmap_model_", run, "_ind_species_v2.png"), width = 8, height = num_species*1.15, limitsize =F)
+
+# for senescence 120-150 days before plays often a vital role, which could indicate that the growing season start plays a large role in this
+
+
+
+```
+
+```{r R-squared and significant coefficients, eval=T}
+
+r2adj <- unlist(sapply(1:length(sum_mod), function(x) sum_mod[[x]][["adj.r.squared"]]))
+r2 <- unlist(sapply(1:length(sum_mod), function(x) sum_mod[[x]][["r.squared"]]))
+hist(r2)
+hist(r2adj)
+summary(r2)
+summary(r2adj)
+
+
+# rows: models, columns: coefficients, entries: significance
+# rows: models, columns: coefficients, entries: significance yes/no
+# num <- 25
+# "hard coded: adapt later"
+class_mod <- sapply(1:length(sum_mod), function(x) class(sum_mod[[x]])) # differentiate between linear and linear mixed effect models
+# num <- sum(class_mod == "summary.lm") # subset of linear modles (lmer model should not be used with p values)
+# sum_mod_red <- sum_mod[1:num]
+# p_mat <- sapply((1:length(sum_mod_red))[intersect(1:num, which(coeff_num==max(coeff_num)))], function(x) sum_mod_red[[x]][["coefficients"]][-1,4]) # extract p-values for all coefficients (besides intercept) from models; only models with max(coeff_num) are selected
+subs <- intersect(which(class_mod == "summary.lm"), which(coeff_num==max(coeff_num))) # subset of linear modles (lmer model should not be used with p values) and models with max(coeff_num)
+p_mat <- sapply(subs, function(x) sum_mod[[x]][["coefficients"]][-1,4]) # extract p-values for all coefficients (besides intercept) from models; only models with max(coeff_num) are selected
+# colnames(p_mat) <- names(mod_case)[intersect(1:num, which(coeff_num==max(coeff_num)))]
+colnames(p_mat) <- names(mod_case)[subs]
+p_sig <- p_mat < 0.05
+p_mat_adj <- matrix(p.adjust(p_mat, "fdr"), nrow = dim(p_mat)[1], ncol = dim(p_mat)[2]) # Benjamini & Hochberg correction 
+# colnames(p_mat_adj) <- names(mod_case_joint)[intersect(1:num, which(coeff_num==max(coeff_num)))]
+colnames(p_mat_adj) <- names(mod_case_joint)[subs]
+rownames(p_mat_adj) <- rownames((p_mat))
+p_sig_adj <- p_mat_adj < 0.05
+
+# par(mar=c(2,8,2,2))
+# barplot(apply(p_sig,1,sum), horiz=T, las=1)
+# barplot(sort(apply(p_sig,1,sum)), horiz=T, las=1)
+# barplot(sort(apply(p_sig[,1:10],1,sum)), horiz=T, las=1, main = "leaf") # leaf
+# barplot(sort(apply(p_sig[,11:23],1,sum)), horiz=T, las=1, main = "flower") # flower
+# barplot(sort(apply(p_sig[,24:31],1,sum)), horiz=T, las=1, main = "fruit") # fruit
+# barplot(sort(apply(p_sig[,32:37],1,sum)), horiz=T, las=1, main = "senes") # senes
+# # there are not so many models to make interesting statistics
+
+
+# significant coeffients can be indicated in the heatmap
+"arbeite diesen Teil oben ein"
+"pick the arrangement of the plot"
+# lmer models last
+# coeff_tib$pval <- c(as.vector(p_sig_adj), rep(NA, 4*18)) # 4*18 added for linear mixed effects models for 4 phases and all 18 variables
+# lmer models first
+coeff_tib$pval <- c( rep(NA, 4*18), as.vector(p_sig_adj)) # 4*18 added for linear mixed effects models for 4 phases and all 18 variables
+coeff_tib$pval_x <- NA
+coeff_tib$pval_x[coeff_tib$pval==T] <- "X"
+coeff_tib_clim <- coeff_tib[!coeff_tib$Variable %in% c("lon", "lat", "alt"),] 
+# coeff_tib_clim <- coeff_tib_clim[!coeff_tib_clim$Variable %in% c("tg_l0:rr_l0","tg_l30:rr_l30","tg_l60:rr_l60","tg_l90:rr_l90","tg_l120:rr_l120"),] 
+# coeff_tib_clim <- coeff_tib_clim[!coeff_tib_clim$Case %in% c("leaf_Pyrus communis","flower_Pyrus communis", "fruit_Pyrus communis"),] 
+
+l <- ggplot(coeff_tib_clim, aes(Variable, Case))
+l <- l + geom_raster(aes(fill = Magnitude), hjust=0.5, vjust=0.5,
+                interpolate=FALSE) +
+  scale_fill_continuous_diverging("Blue-Red 3") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1), 
+        axis.title = element_text(size = 20), legend.title=element_text(size=13),
+        axis.text = element_text(size = 12)) +
+  # labs(title = paste("Magnitude of regression coefficients ")) +
+  labs(title = "") +
+  ylab("Phenophase and species")
+# l + geom_text(aes(label = pval))
+l + geom_text(aes(label = pval_x))
+# ggsave(filename = paste0("./Output/heatmap_model_", run, "_ind_species_pval_adj.png"), width = 8, height = num_species*1.15, limitsize = F)
+ggsave(filename = paste0("./Output/heatmap_model_", run, "_ind_species_pval_adj_rev.png"), width = 8, height = num_species*1.15, limitsize = F) # lmer models first
+# ggsave(filename = paste0("./Output/heatmap_model_", run, "_ind_species_pval.png"), width = 7, height = 8)
+
+
+```
+
+
+
+
+
